@@ -1,0 +1,6 @@
+name = Marketo Prefill
+description = Provides Marketo forms 2.0 abilities.
+core = 7.x
+package = Marketo
+
+files[] = marketo_prefill.module

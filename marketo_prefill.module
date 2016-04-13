@@ -1,0 +1,243 @@
+<?php
+
+/**
+ * @file
+ * Implements Marketo Forms 2.0 prefilling.
+ * 
+ * @author Domenic Santangelo <dsantangelo@magento.com>, @entendu
+ */
+
+/**
+ * Implements hook_init().
+*/
+function marketo_prefill_init() {
+  if (variable_get('marketo_prefill_enabled', FALSE)) {
+    drupal_add_js(array('marketo_prefill_enabled' => TRUE), 'setting');
+  }
+}
+
+/**
+ * Implements hook_menu().
+*/
+function marketo_prefill_menu() {
+  // Module settings.
+  $items['admin/config/system/marketo_prefill'] = array(
+    'title' => 'Marketo Prefill Configuration',
+    'description' => 'Marketo prefilling configuration',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('marketo_prefill_admin_settings_form'),
+    'access arguments' => array('administer content'),
+  );
+  $items['m/pf'] = array(
+    'title' => 'Get marketo prefill infoz',
+    'page callback' => 'marketo_prefill_retrieve_fields',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Builds and returns the Marketo prefill settings form.
+ */
+function marketo_prefill_admin_settings_form($form, &$form_state) {
+  $form['marketo_prefill_enabled'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable prefilling?'),
+    '#description' => t("Don't forget to clear cache after changing this."),
+    '#default_value' => variable_get('marketo_prefill_enabled', FALSE),
+    '#weight' => -1,
+  );
+  $form['marketo_prefill_token_endpoint'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Marketo REST Token endpoint'),
+    '#description' => t('For example, https://XXX-YYY-ZZZ.mktorest.com/identity/oauth/token. Grant type is automatically added.'),
+    '#default_value' => variable_get('marketo_prefill_token_endpoint', ''),
+    '#required' => TRUE,
+  );
+  $form['marketo_prefill_lead_endpoint'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Marketo REST Lead endpoint'),
+    '#description' => t('For example, https://XXX-YYY-ZZZ.mktorest.com/rest/v1/leads.json'),
+    '#default_value' => variable_get('marketo_prefill_lead_endpoint', ''),
+    '#required' => TRUE,
+  );
+  $form['marketo_prefill_client_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Marketo REST Client ID'),
+    '#default_value' => variable_get('marketo_prefill_client_id', ''),
+    '#required' => TRUE,
+  );
+  $form['marketo_prefill_client_secret'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Marketo REST Client Secret'),
+    '#default_value' => variable_get('marketo_prefill_client_secret', ''),
+    '#required' => TRUE,
+  );
+  $form['marketo_prefill_fields'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Marketo fields to prefill'),
+    '#default_value' => variable_get('marketo_prefill_fields', ''),
+    '#description' => t('Fields to prefill. Fields are case sensitive. Enter each field on a new line.'),
+    '#rows' => 10,
+  );
+  $form['marketo_prefill_automation_protection_enabled'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable anti-automation protection?'),
+    '#default_value' => variable_get('marketo_prefill_automation_protection_enabled', FALSE),
+    '#weight' => 100,
+  );
+  $form['marketo_prefill_automation_protection_times'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Anti-automation: allow this many unique requsts from an IP address'),
+    '#default_value' => variable_get('marketo_prefill_automation_protection_times', 5),
+    '#required' => FALSE,
+  );
+  $form['marketo_prefill_automation_protection_minutes'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Anti-automation: allow the above number of requests over this length of time (in seconds)'),
+    '#default_value' => variable_get('marketo_prefill_automation_protection_minutes', 180),
+    '#required' => FALSE,
+  );
+  return system_settings_form($form);
+}
+
+function marketo_prefill_retrieve_fields($access_token = FALSE) {
+  if (!variable_get('marketo_prefill_enabled', FALSE)) {
+    return FALSE;
+  }
+
+  // Anti-automation, if enabled. Events only register if Marketo is called.
+  if (variable_get('marketo_prefill_automation_protection_enabled', FALSE)) {
+    if (!flood_is_allowed('marketo_prefill', variable_get('marketo_prefill_automation_protection_times', 5), variable_get('marketo_prefill_automation_protection_minutes', 180))) {
+      watchdog('marketo_prefill', 'Anti-automation protection triggered.', array(), WATCHDOG_WARNING);
+      drupal_json_output(array());
+      drupal_exit();
+    }
+  }
+
+  // Set up required configuration.
+  $lead_endpoint = variable_get('marketo_prefill_lead_endpoint', FALSE);
+  $prefill_fields = variable_get('marketo_prefill_fields', FALSE);
+  $access_token = $access_token ? $access_token : variable_get('marketo_prefill_access_token', marketo_prefill_refresh_token());
+  if (!$lead_endpoint || !$prefill_fields || !$access_token) {
+    drupal_json_output(array());
+    drupal_exit();
+  }
+
+  // Set up fields.
+  $final_vals = array();
+  $prefill_field_array = array_map('trim', explode(PHP_EOL, $prefill_fields));
+
+  $cid = $_POST['cv'];
+  if ($cid) {
+    if ($cached_vals = marketo_prefill_get_cached_values($cid)) {
+      $final_vals = $cached_vals;
+      // Uncomment this to see when you're getting cached values.
+      //$final_vals['cached'] = TRUE;
+    }
+    else {
+      $fields = implode(',', $prefill_field_array);
+
+      $options = array(
+        'filterType' => 'cookie',
+        'filterValues' => $cid,
+        'fields' => $fields,
+        'access_token' => $access_token,
+      );
+      $full_url = url($lead_endpoint, array('query' => $options));
+
+      // Query Marketo for prefill information
+      $response = drupal_http_request($full_url);
+
+      $res = json_decode($response->data);
+      if ($res->success) {
+        // When queried for "Email", Marketo will return "email" -- case is not
+        // guaranteed. But, sometimes Marketo WILL return properly cased keys,
+        // like "LeadSource__c". However, we can't just STRTOLOWER ALL THE THINGS
+        // because the MktoForms js API requires a case match to prefill the form
+        // on the front end. Sooooooooooo here's the gymnastics required to deal
+        // with their life choices:
+        // Cast the API return to an array, convert keys to lower case.
+        $ret_fields = array_change_key_case((array) $res->result[0], CASE_LOWER);
+        // We only want to return the fields that we asked for, otherwise we could
+        // risk exposing additional Lead information. Because of the case problem
+        // explained above, compare the lower case keys of $ret_fields to
+        // strtolower'd versions of the field list $form_fields. If match, include
+        // the value in the return array ($final_vals), BUT make sure to key it
+        // with the originally-cased key so the front end will recognize it.
+        foreach ($prefill_field_array as $f) {
+          $g = strtolower($f);
+          if (!empty($ret_fields[$g])) {
+            $final_vals[$f] = $ret_fields[$g];
+          }
+        }
+      }
+      // If $res->success = FALSE, the API key expired or something else bad
+      // happened. Get a new token and try this again.
+      else {
+        if ($token = marketo_prefill_refresh_token()) {
+          // If something goes terribly wrong we could get stuck in an infinite
+          // loop. Trapdoor this and try only once.
+          static $trapdoor = 0;
+          $trapdoor++;
+          if ($trapdoor < 2) {
+            marketo_prefill_retrieve_fields($token);
+            return FALSE;
+          }
+        }
+      }
+      // Cache the prefill values so we don't have to go pinging Marketo every
+      // time a form is loaded. Save for 5 minutes. Also register a flood event.
+      cache_set('marketo_prefill_data' . $cid, serialize($final_vals), 'cache', time() + 300);
+      flood_register_event('marketo_prefill', variable_get('marketo_prefill_automation_protection_minutes', 180));
+    }
+  }
+  // Kinda dope because even if the call fails or there are no return values,
+  // we will still return a json string.
+  drupal_json_output($final_vals);
+}
+
+/**
+ * Retrieves the cached value for the user's prefilled forms.
+ *
+ * @param $cid - Marketo cookie
+ * @return array|mixed - The form value array, or FALSE if not found.
+ */
+function marketo_prefill_get_cached_values($cid) {
+  $cached_values = array();
+  if ($cache = cache_get('marketo_prefill_data' . $cid)) {
+    $cached_values = unserialize($cache->data);
+  }
+  return $cached_values;
+}
+
+/**
+ * Refreshes the Marketo API token, which expires after a length of time.
+ */
+function marketo_prefill_refresh_token() {
+  $token_endpoint = variable_get('marketo_prefill_token_endpoint', FALSE);
+  $client_id = variable_get('marketo_prefill_client_id', FALSE);
+  $client_secret = variable_get('marketo_prefill_client_secret', FALSE);
+  if (!$token_endpoint || !$client_id || !$client_secret) {
+    return FALSE;
+  }
+
+  // Query Marketo for token.
+  $options = array(
+    'client_id' => $client_id,
+    'client_secret' => $client_secret,
+    'grant_type' => 'client_credentials',
+    );
+  $full_url = url($token_endpoint, array('query' => $options));
+  $response = drupal_http_request($full_url);
+
+  if ($response->data) {
+    $res = json_decode($response->data);
+    if (!empty($res->access_token)) {
+      variable_set('marketo_prefill_access_token', $res->access_token);
+      return $res->access_token;
+    }
+  }
+  return FALSE;
+}
