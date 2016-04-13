@@ -26,7 +26,7 @@ function marketo_prefill_menu() {
     'description' => 'Marketo prefilling configuration',
     'page callback' => 'drupal_get_form',
     'page arguments' => array('marketo_prefill_admin_settings_form'),
-    'access arguments' => array('administer content'),
+    'access arguments' => array('administer nodes'),
   );
   $items['m/pf'] = array(
     'title' => 'Get marketo prefill infoz',
